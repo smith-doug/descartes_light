@@ -66,19 +66,20 @@ SubGraph<FloatType> createDecoratedSubGraph(const BGLGraph<FloatType>& g)
   // Add the edges to the subgraph
   auto weights = boost::get(boost::edge_weight, g);
 
-  EdgeIt<FloatType> first, last;
-  boost::tie(first, last) = boost::edges(g);
-  for (auto it = first; it != last; ++it)
+  // EdgeIt<FloatType> first, last;
+  // boost::tie(first, last) = boost::edges(g);
+  //for (auto it = first; it != last; ++it)
+  for(auto it : boost::make_iterator_range(boost::edges(g)))
   {
-    VertexDesc<FloatType> source = boost::source(*it, g);
-    VertexDesc<FloatType> target = boost::target(*it, g);
+    VertexDesc<FloatType> source = boost::source(it, g);
+    VertexDesc<FloatType> target = boost::target(it, g);
 
     bool added;
     EdgeDesc<FloatType> e;
-    boost::tie(e, added) = boost::add_edge(source, target, weights[*it], main);
+    boost::tie(e, added) = boost::add_edge(source, target, weights[it], main);
 
     std::stringstream ss;
-    ss << std::setprecision(4) << weights[*it];
+    ss << std::setprecision(4) << weights[it];
     boost::get(boost::edge_attribute, main)[e][LABEL_ATTR] = ss.str();
   }
 
