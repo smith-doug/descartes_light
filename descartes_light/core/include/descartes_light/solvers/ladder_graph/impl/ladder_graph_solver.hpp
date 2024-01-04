@@ -27,6 +27,7 @@ DESCARTES_IGNORE_WARNINGS_PUSH
 #include <Eigen/Geometry>
 #include <chrono>
 #include <iostream>
+#include <oneapi/tbb.h>
 DESCARTES_IGNORE_WARNINGS_POP
 
 #include <descartes_light/solvers/ladder_graph/ladder_graph_solver.h>
@@ -71,12 +72,22 @@ LadderGraphSolver<FloatType>::LadderGraphSolver(int num_threads) : num_threads_{
 {
 }
 
+template <typename FloatT>
+struct MyNode : public Node<FloatT>
+{
+  MyNode() noexcept = default;
+  MyNode(const StateSample<FloatT>& sample_, int cost_mil = 0) noexcept : Node<FloatT>(sample_), cost(cost_mil) {}
+
+  std::atomic_int32_t cost = 0;
+};
+
 template <typename FloatType>
 BuildStatus LadderGraphSolver<FloatType>::buildImpl(
     const std::vector<typename WaypointSampler<FloatType>::ConstPtr>& trajectory,
     const std::vector<typename EdgeEvaluator<FloatType>::ConstPtr>& edge_evaluators,
     const std::vector<typename StateEvaluator<FloatType>::ConstPtr>& state_evaluators)
 {
+  using namespace oneapi;
   BuildStatus status;
   graph_.resize(trajectory.size());
 
@@ -84,52 +95,122 @@ BuildStatus LadderGraphSolver<FloatType>::buildImpl(
   long num_waypoints = static_cast<long>(trajectory.size());
   long cnt = 0;
 
+  auto console_bridge_loglevel = console_bridge::getLogLevel();
+
+  static tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 36);
+  int thread_limit = oneapi::tbb::global_control::active_value(oneapi::tbb::global_control::max_allowed_parallelism);
+  std::cout << "########### thread limit: " << thread_limit << "\n\n" << std::endl;
+
   using Clock = std::chrono::high_resolution_clock;
   std::chrono::time_point<Clock> start_time = Clock::now();
-#pragma omp parallel for num_threads(num_threads_)
-  for (long i = 0; i < static_cast<long>(trajectory.size()); ++i)
+
+  //#pragma omp parallel for num_threads(num_threads_)
+  //#pragma omp parallel for schedule(dynamic) num_threads(num_threads_)
+  std::vector<StateSample<FloatType>> samples_full[trajectory.size()];
+  tbb::concurrent_vector<size_t> failed_vertices;
+  tbb::parallel_for(tbb::blocked_range<size_t>(0, trajectory.size()), [&](const tbb::blocked_range<size_t>& r) {
+    for (size_t i = r.begin(); i != r.end(); i++)
+    {
+      samples_full[i] = trajectory[static_cast<size_t>(i)]->sample();
+      if (samples_full[i].empty())
+      {
+        failed_vertices.push_back(static_cast<size_t>(i));
+      }
+    }
+  });
+
+  tbb::concurrent_vector<Node<FloatType>> r_nodes_all[trajectory.size()];
+  tbb::combinable<FloatType> sample_cost;
+
+  oneapi::tbb::task_arena arena(num_threads_);
+  //  arena.execute([&] {
+
+  tbb::parallel_for(tbb::blocked_range<size_t>(0, trajectory.size()), [&](const tbb::blocked_range<size_t>& r) {
+    for (size_t i = r.begin(); i != r.end(); i++)
+    {
+      // r.nodes.reserve(samples.size());
+      tbb::parallel_for(
+          tbb::blocked_range<size_t>(0, samples_full[i].size()), [&](const tbb::blocked_range<size_t>& r2) {
+            // auto& r = graph_.getRung(static_cast<size_t>(i));
+            //  std::vector<Node<FloatType>> nodes;
+            auto& r_nodes = r_nodes_all[i];
+
+            for (size_t j = r2.begin(); j != r2.end(); j++)
+            {
+              auto& sample = samples_full[i][j];
+              if (state_evaluators.empty())
+              {
+                r_nodes.push_back(Node<FloatType>(sample));
+              }
+              else
+              {
+                std::pair<bool, FloatType> results = state_evaluators[static_cast<size_t>(i)]->evaluate(*sample.state);
+                if (results.first)
+                {
+                  sample.cost += results.second;
+                  r_nodes.push_back(Node<FloatType>(sample));
+                }
+              }
+            }
+            // r.nodes = std::vector<Node<FloatType>>(r_nodes.begin(), r_nodes.end());
+          });
+    }
+  });
+  //  });
+
+  for (size_t i = 0; i < trajectory.size(); i++)
   {
-    std::vector<StateSample<FloatType>> samples = trajectory[static_cast<size_t>(i)]->sample();
-    if (!samples.empty())
-    {
-      auto& r = graph_.getRung(static_cast<size_t>(i));
-      r.nodes.reserve(samples.size());
-      for (auto& sample : samples)
-      {
-        if (state_evaluators.empty())
-        {
-          r.nodes.push_back(Node<FloatType>(sample));
-        }
-        else
-        {
-          std::pair<bool, FloatType> results = state_evaluators[static_cast<size_t>(i)]->evaluate(*sample.state);
-          if (results.first)
-          {
-            sample.cost += results.second;
-            r.nodes.push_back(Node<FloatType>(sample));
-          }
-        }
-      }
-    }
-    else
-    {
-#pragma omp critical
-      {
-        status.failed_vertices.push_back(static_cast<size_t>(i));
-      }
-    }
-#ifndef NDEBUG
-#pragma omp critical
-    {
-      ++cnt;
-      std::stringstream ss;
-      ss << "Descartes Processed: " << cnt << " of " << num_waypoints << " vertices";
-      CONSOLE_BRIDGE_logInform(ss.str().c_str());
-    }
-#endif
+    auto& r = graph_.getRung(static_cast<size_t>(i));
+    auto& r_nodes = r_nodes_all[i];
+    r.nodes = std::vector<Node<FloatType>>(r_nodes.begin(), r_nodes.end());
   }
+
+  status.failed_vertices.clear();
+  status.failed_vertices.insert(status.failed_vertices.begin(), failed_vertices.begin(), failed_vertices.end());
+
+  //  for (long i = 0; i < static_cast<long>(trajectory.size()); ++i)
+  //  {
+  //    std::vector<StateSample<FloatType>> samples = trajectory[static_cast<size_t>(i)]->sample();
+  //    if (!samples.empty())
+  //    {
+  //      auto& r = graph_.getRung(static_cast<size_t>(i));
+  //      r.nodes.reserve(samples.size());
+  //      for (auto& sample : samples)
+  //      {
+  //        if (state_evaluators.empty())
+  //        {
+  //          r.nodes.push_back(Node<FloatType>(sample));
+  //        }
+  //        else
+  //        {
+  //          std::pair<bool, FloatType> results = state_evaluators[static_cast<size_t>(i)]->evaluate(*sample.state);
+  //          if (results.first)
+  //          {
+  //            sample.cost += results.second;
+  //            r.nodes.push_back(Node<FloatType>(sample));
+  //          }
+  //        }
+  //      }
+  //    }
+  //    else
+  //    {
+  //#pragma omp critical
+  //      {
+  //        status.failed_vertices.push_back(static_cast<size_t>(i));
+  //      }
+  //    }
+  //#ifndef NDEBUG
+  //#pragma omp critical
+  //    {
+  //      ++cnt;
+  //      std::stringstream ss;
+  //      ss << "Descartes Processed: " << cnt << " of " << num_waypoints << " vertices";
+  //      CONSOLE_BRIDGE_logInform(ss.str().c_str());
+  //    }
+  //#endif
+  //  }
   double duration = std::chrono::duration<double>(Clock::now() - start_time).count();
-  CONSOLE_BRIDGE_logDebug("Descartes took %0.4f seconds to build vertices.", duration);
+  CONSOLE_BRIDGE_logDebug("aaaaaDescartes took %0.4f seconds to build vertices.", duration);
 
   if (!status.failed_vertices.empty())
   {
@@ -140,11 +221,10 @@ BuildStatus LadderGraphSolver<FloatType>::buildImpl(
       std::stringstream s;
       s << vert_idx << ": " << *pos;
 
-      if (console_bridge::getLogLevel() == console_bridge::LogLevel::CONSOLE_BRIDGE_LOG_DEBUG)
+      if (console_bridge_loglevel == console_bridge::LogLevel::CONSOLE_BRIDGE_LOG_DEBUG)
       {
         std::cout << s.str().c_str() << std::endl;
       }
-
     }
   }
   // Build Edges
@@ -206,7 +286,7 @@ BuildStatus LadderGraphSolver<FloatType>::buildImpl(
   std::sort(status.failed_edges.begin(), status.failed_edges.end());
 
   // CONSOLE_BRIDGE_logDebug has a limited buffer size and can't handle outputting a large graph.
-  if (console_bridge::getLogLevel() <= console_bridge::CONSOLE_BRIDGE_LOG_DEBUG)
+  if (console_bridge_loglevel <= console_bridge::CONSOLE_BRIDGE_LOG_DEBUG)
   {
     std::cout << graph_ << std::endl;
   }

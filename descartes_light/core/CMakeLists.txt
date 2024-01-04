@@ -3,6 +3,7 @@ find_package(Eigen3 REQUIRED)
 find_package(ros_industrial_cmake_boilerplate REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(console_bridge)
+find_package(TBB REQUIRED)
 
 # Create targets if necessary
 if(NOT TARGET OpenMP::OpenMP_CXX)
@@ -49,7 +50,7 @@ add_library(
   src/solvers/ladder_graph/ladder_graph_solver.cpp
   src/solvers/ladder_graph/ladder_graph.cpp
   src/solvers/ladder_graph/ladder_graph_dag_search.cpp)
-target_link_libraries(${PROJECT_NAME} PUBLIC Eigen3::Eigen OpenMP::OpenMP_CXX console_bridge::console_bridge)
+target_link_libraries(${PROJECT_NAME} PUBLIC Eigen3::Eigen OpenMP::OpenMP_CXX console_bridge::console_bridge TBB::tbb)
 target_cxx_version(${PROJECT_NAME} PUBLIC VERSION ${DESCARTES_CXX_VERSION})
 target_compile_options(${PROJECT_NAME} PUBLIC ${DESCARTES_COMPILE_OPTIONS})
 target_compile_definitions(${PROJECT_NAME} PUBLIC ${DESCARTES_COMPILE_DEFINITIONS})
@@ -74,7 +75,7 @@ configure_component(
   COMPONENT core
   NAMESPACE descartes
   TARGETS ${PROJECT_NAME}
-  DEPENDENCIES Eigen3 console_bridge OpenMP
+  DEPENDENCIES Eigen3 console_bridge OpenMP TBB
   CFG_EXTRAS cmake/core-macros.cmake cmake/core-extras.cmake)
 
 if(DESCARTES_PACKAGE)
